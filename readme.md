@@ -1,4 +1,4 @@
-# Pipedrive MCP Server v.1.0.3
+# Pipedrive MCP Server
 
 This is a Model Context Protocol (MCP) server that connects to the Pipedrive API v2. It allows you to expose Pipedrive data and functionality to LLM applications like Claude.
 
@@ -40,16 +40,37 @@ This is a Model Context Protocol (MCP) server that connects to the Pipedrive API
 
 #### Option 1: Using Docker Compose (standalone)
 
-1. Copy `.env.example` to `.env` and configure your settings
-2. Build and run with Docker Compose:
+1. Copy `.env.example` to `.env` and configure your settings:
+   ```bash
+   PIPEDRIVE_API_TOKEN=your_api_token_here
+   PIPEDRIVE_DOMAIN=your-company.pipedrive.com
+   MCP_TRANSPORT=sse  # Use SSE transport for Docker
+   MCP_PORT=3000
    ```
+2. Build and run with Docker Compose:
+   ```bash
    docker-compose up -d
    ```
+3. The server will be available at `http://localhost:3000`
+   - SSE endpoint: `http://localhost:3000/sse`
+   - Health check: `http://localhost:3000/health`
 
 #### Option 2: Using Pre-built Docker Image
 
 Pull and run the pre-built image from GitHub Container Registry:
 
+**For SSE transport (HTTP access):**
+```bash
+docker run -d \
+  -p 3000:3000 \
+  -e PIPEDRIVE_API_TOKEN=your_api_token_here \
+  -e PIPEDRIVE_DOMAIN=your-company.pipedrive.com \
+  -e MCP_TRANSPORT=sse \
+  -e MCP_PORT=3000 \
+  ghcr.io/juhokoskela/pipedrive-mcp-server:main
+```
+
+**For stdio transport (local use):**
 ```bash
 docker run -i \
   -e PIPEDRIVE_API_TOKEN=your_api_token_here \
@@ -69,13 +90,21 @@ services:
     image: ghcr.io/juhokoskela/pipedrive-mcp-server:main
     container_name: pipedrive-mcp-server
     restart: unless-stopped
-    stdin_open: true
-    tty: true
+    ports:
+      - "3000:3000"
     environment:
       - PIPEDRIVE_API_TOKEN=${PIPEDRIVE_API_TOKEN}
       - PIPEDRIVE_DOMAIN=${PIPEDRIVE_DOMAIN}
+      - MCP_TRANSPORT=sse
+      - MCP_PORT=3000
       - PIPEDRIVE_RATE_LIMIT_MIN_TIME_MS=${PIPEDRIVE_RATE_LIMIT_MIN_TIME_MS:-250}
       - PIPEDRIVE_RATE_LIMIT_MAX_CONCURRENT=${PIPEDRIVE_RATE_LIMIT_MAX_CONCURRENT:-2}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     logging:
       driver: "json-file"
       options:
@@ -98,9 +127,16 @@ Optional (JWT Authentication):
 - `MCP_JWT_AUDIENCE` - JWT audience
 - `MCP_JWT_ISSUER` - JWT issuer
 
+When JWT authentication is enabled, all SSE requests (`/sse` and the message endpoint) must include an `Authorization: Bearer <token>` header signed with the configured secret.
+
 Optional (Rate Limiting):
 - `PIPEDRIVE_RATE_LIMIT_MIN_TIME_MS` - Minimum time between requests in milliseconds (default: 250)
 - `PIPEDRIVE_RATE_LIMIT_MAX_CONCURRENT` - Maximum concurrent requests (default: 2)
+
+Optional (Transport Configuration):
+- `MCP_TRANSPORT` - Transport type: `stdio` (default, for local use) or `sse` (for Docker/HTTP access)
+- `MCP_PORT` - Port for SSE transport (default: 3000, only used when `MCP_TRANSPORT=sse`)
+- `MCP_ENDPOINT` - Message endpoint path for SSE (default: /message, only used when `MCP_TRANSPORT=sse`)
 
 ## Using with Claude
 

@@ -1,10 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 import * as pipedrive from "pipedrive";
 import * as dotenv from 'dotenv';
 import Bottleneck from 'bottleneck';
 import jwt from 'jsonwebtoken';
+import http from 'http';
 
 // Type for error handling
 interface ErrorWithMessage {
@@ -42,6 +44,13 @@ if (!process.env.PIPEDRIVE_DOMAIN) {
 }
 
 const jwtSecret = process.env.MCP_JWT_SECRET;
+const jwtAlgorithm = (process.env.MCP_JWT_ALGORITHM || 'HS256') as jwt.Algorithm;
+const jwtVerifyOptions = {
+  algorithms: [jwtAlgorithm],
+  audience: process.env.MCP_JWT_AUDIENCE,
+  issuer: process.env.MCP_JWT_ISSUER,
+};
+
 if (jwtSecret) {
   const bootToken = process.env.MCP_JWT_TOKEN;
   if (!bootToken) {
@@ -50,16 +59,35 @@ if (jwtSecret) {
   }
 
   try {
-    jwt.verify(bootToken, jwtSecret, {
-      algorithms: [(process.env.MCP_JWT_ALGORITHM || 'HS256') as jwt.Algorithm],
-      audience: process.env.MCP_JWT_AUDIENCE,
-      issuer: process.env.MCP_JWT_ISSUER,
-    });
+    jwt.verify(bootToken, jwtSecret, jwtVerifyOptions);
   } catch (error) {
     console.error("ERROR: Failed to verify MCP_JWT_TOKEN", error);
     process.exit(1);
   }
 }
+
+const verifyRequestAuthentication = (req: http.IncomingMessage) => {
+  if (!jwtSecret) {
+    return { ok: true } as const;
+  }
+
+  const header = req.headers['authorization'];
+  if (!header) {
+    return { ok: false, status: 401, message: 'Missing Authorization header' } as const;
+  }
+
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token) {
+    return { ok: false, status: 401, message: 'Invalid Authorization header format' } as const;
+  }
+
+  try {
+    jwt.verify(token, jwtSecret, jwtVerifyOptions);
+    return { ok: true } as const;
+  } catch (error) {
+    return { ok: false, status: 401, message: 'Invalid or expired token' } as const;
+  }
+};
 
 const limiter = new Bottleneck({
   minTime: Number(process.env.PIPEDRIVE_RATE_LIMIT_MIN_TIME_MS || 250),
@@ -701,12 +729,14 @@ server.tool(
       const allStages = [];
       for (const pipeline of pipelines) {
         try {
-          // This is using the API to get stages by pipeline ID
-          const stagesResponse = await fetch(`https://api.pipedrive.com/api/v2/stages?pipeline_id=${pipeline.id}&api_token=${process.env.PIPEDRIVE_API_TOKEN}`);
-          const stagesData = await stagesResponse.json();
-          
-          if (stagesData.success && stagesData.data) {
-            const pipelineStages = stagesData.data.map((stage: any) => ({
+          // @ts-ignore - Type definitions for getPipelineStages are incomplete
+          const stagesResponse = await pipelinesApi.getPipelineStages(pipeline.id);
+          const stagesData = Array.isArray(stagesResponse?.data)
+            ? stagesResponse.data
+            : [];
+
+          if (stagesData.length > 0) {
+            const pipelineStages = stagesData.map((stage: any) => ({
               ...stage,
               pipeline_name: pipeline.name
             }));
@@ -930,11 +960,124 @@ server.prompt(
   })
 );
 
-// Start the server with stdio transport
-const transport = new StdioServerTransport();
-server.connect(transport).catch(err => {
-  console.error("Failed to start MCP server:", err);
-  process.exit(1);
-});
+// Get transport type from environment variable (default to stdio)
+const transportType = process.env.MCP_TRANSPORT || 'stdio';
 
-console.error("Pipedrive MCP Server started");
+if (transportType === 'sse') {
+  // SSE transport - create HTTP server
+  const port = parseInt(process.env.MCP_PORT || '3000', 10);
+  const endpoint = process.env.MCP_ENDPOINT || '/message';
+
+  // Store active transports by session ID
+  const transports = new Map<string, SSEServerTransport>();
+
+  const httpServer = http.createServer(async (req, res) => {
+    const url = new URL(req.url!, `http://${req.headers.host}`);
+
+    // Enable CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Session-Id');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/sse') {
+      const authResult = verifyRequestAuthentication(req);
+      if (!authResult.ok) {
+        res.writeHead(authResult.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: authResult.message }));
+        return;
+      }
+
+      // Establish SSE connection
+      console.error('New SSE connection request');
+      const transport = new SSEServerTransport(endpoint, res);
+
+      // Store transport by session ID
+      transports.set(transport.sessionId, transport);
+
+      transport.onclose = () => {
+        console.error(`SSE connection closed: ${transport.sessionId}`);
+        transports.delete(transport.sessionId);
+      };
+
+      try {
+        await server.connect(transport);
+        console.error(`SSE connection established: ${transport.sessionId}`);
+      } catch (err) {
+        console.error('Failed to establish SSE connection:', err);
+        transports.delete(transport.sessionId);
+      }
+    } else if (req.method === 'POST' && url.pathname === endpoint) {
+      const authResult = verifyRequestAuthentication(req);
+      if (!authResult.ok) {
+        res.writeHead(authResult.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: authResult.message }));
+        return;
+      }
+
+      // Handle incoming message
+      const sessionId = url.searchParams.get('sessionId') || req.headers['x-session-id'] as string;
+
+      if (!sessionId) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sessionId' }));
+        return;
+      }
+
+      const transport = transports.get(sessionId);
+      if (!transport) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Session not found' }));
+        return;
+      }
+
+      req.on('error', err => {
+        console.error('Error receiving POST message body:', err);
+        if (!res.headersSent) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid request body' }));
+        }
+      });
+
+      try {
+        await transport.handlePostMessage(req, res);
+      } catch (err) {
+        console.error('Error handling POST message:', err);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Internal server error' }));
+        }
+      }
+    } else {
+      // Health check endpoint
+      if (req.method === 'GET' && url.pathname === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', transport: 'sse' }));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end('Not found');
+    }
+  });
+
+  httpServer.listen(port, () => {
+    console.error(`Pipedrive MCP Server (SSE) listening on port ${port}`);
+    console.error(`SSE endpoint: http://localhost:${port}/sse`);
+    console.error(`Message endpoint: http://localhost:${port}${endpoint}`);
+  });
+} else {
+  // Default: stdio transport
+  const transport = new StdioServerTransport();
+  server.connect(transport).catch(err => {
+    console.error("Failed to start MCP server:", err);
+    process.exit(1);
+  });
+
+  console.error("Pipedrive MCP Server started (stdio transport)");
+}
