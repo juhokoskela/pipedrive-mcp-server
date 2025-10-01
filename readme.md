@@ -1,4 +1,4 @@
-# Pipedrive MCP Server
+# Pipedrive MCP Server v.1.0.3
 
 This is a Model Context Protocol (MCP) server that connects to the Pipedrive API v2. It allows you to expose Pipedrive data and functionality to LLM applications like Claude.
 
