@@ -3,6 +3,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import * as pipedrive from "pipedrive";
 import * as dotenv from 'dotenv';
+import Bottleneck from 'bottleneck';
+import jwt from 'jsonwebtoken';
 
 // Type for error handling
 interface ErrorWithMessage {
@@ -34,23 +36,72 @@ if (!process.env.PIPEDRIVE_API_TOKEN) {
   process.exit(1);
 }
 
-// Initialize Pipedrive API client with API token
+if (!process.env.PIPEDRIVE_DOMAIN) {
+  console.error("ERROR: PIPEDRIVE_DOMAIN environment variable is required (e.g., 'ukkofi.pipedrive.com')");
+  process.exit(1);
+}
+
+const jwtSecret = process.env.MCP_JWT_SECRET;
+if (jwtSecret) {
+  const bootToken = process.env.MCP_JWT_TOKEN;
+  if (!bootToken) {
+    console.error("ERROR: MCP_JWT_TOKEN environment variable is required when MCP_JWT_SECRET is set");
+    process.exit(1);
+  }
+
+  try {
+    jwt.verify(bootToken, jwtSecret, {
+      algorithms: [(process.env.MCP_JWT_ALGORITHM || 'HS256') as jwt.Algorithm],
+      audience: process.env.MCP_JWT_AUDIENCE,
+      issuer: process.env.MCP_JWT_ISSUER,
+    });
+  } catch (error) {
+    console.error("ERROR: Failed to verify MCP_JWT_TOKEN", error);
+    process.exit(1);
+  }
+}
+
+const limiter = new Bottleneck({
+  minTime: Number(process.env.PIPEDRIVE_RATE_LIMIT_MIN_TIME_MS || 250),
+  maxConcurrent: Number(process.env.PIPEDRIVE_RATE_LIMIT_MAX_CONCURRENT || 2),
+});
+
+const withRateLimit = <T extends object>(client: T): T => {
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value === 'function') {
+        return (...args: unknown[]) => limiter.schedule(() => (value as Function).apply(target, args));
+      }
+      return value;
+    },
+  });
+};
+
+// Initialize Pipedrive API client with API token and custom domain
 const apiClient = new pipedrive.ApiClient();
+apiClient.basePath = `https://${process.env.PIPEDRIVE_DOMAIN}/api/v1`;
 apiClient.authentications = apiClient.authentications || {};
-apiClient.authentications['api_key'] = { 
-  type: 'apiKey', 
-  'in': 'query', 
+apiClient.authentications['api_key'] = {
+  type: 'apiKey',
+  'in': 'query',
   name: 'api_token',
-  apiKey: process.env.PIPEDRIVE_API_TOKEN 
+  apiKey: process.env.PIPEDRIVE_API_TOKEN
 };
 
 // Initialize Pipedrive API clients
-const dealsApi = new pipedrive.DealsApi(apiClient);
-const personsApi = new pipedrive.PersonsApi(apiClient);
-const organizationsApi = new pipedrive.OrganizationsApi(apiClient);
-const pipelinesApi = new pipedrive.PipelinesApi(apiClient);
-const itemSearchApi = new pipedrive.ItemSearchApi(apiClient);
-const leadsApi = new pipedrive.LeadsApi(apiClient);
+const dealsApi = withRateLimit(new pipedrive.DealsApi(apiClient));
+const personsApi = withRateLimit(new pipedrive.PersonsApi(apiClient));
+const organizationsApi = withRateLimit(new pipedrive.OrganizationsApi(apiClient));
+const pipelinesApi = withRateLimit(new pipedrive.PipelinesApi(apiClient));
+const itemSearchApi = withRateLimit(new pipedrive.ItemSearchApi(apiClient));
+const leadsApi = withRateLimit(new pipedrive.LeadsApi(apiClient));
+// @ts-ignore - ActivitiesApi exists but may not be in type definitions
+const activitiesApi = withRateLimit(new pipedrive.ActivitiesApi(apiClient));
+// @ts-ignore - NotesApi exists but may not be in type definitions
+const notesApi = withRateLimit(new pipedrive.NotesApi(apiClient));
+// @ts-ignore - UsersApi exists but may not be in type definitions
+const usersApi = withRateLimit(new pipedrive.UsersApi(apiClient));
 
 // Create MCP server
 const server = new McpServer({
@@ -65,18 +116,202 @@ const server = new McpServer({
 
 // === TOOLS ===
 
-// Get all deals
+// Get all users (for finding owner IDs)
 server.tool(
-  "get-deals",
-  "Get all deals from Pipedrive including custom fields",
+  "get-users",
+  "Get all users/owners from Pipedrive to identify owner IDs for filtering deals",
   {},
   async () => {
     try {
-      const response = await dealsApi.getDeals();
+      const response = await usersApi.getUsers();
+      const users = response.data?.map((user: any) => ({
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        active_flag: user.active_flag,
+        role_name: user.role_name
+      })) || [];
+
       return {
         content: [{
           type: "text",
-          text: JSON.stringify(response.data, null, 2)
+          text: JSON.stringify({
+            summary: `Found ${users.length} users in your Pipedrive account`,
+            users: users
+          }, null, 2)
+        }]
+      };
+    } catch (error) {
+      console.error("Error fetching users:", error);
+      return {
+        content: [{
+          type: "text",
+          text: `Error fetching users: ${getErrorMessage(error)}`
+        }],
+        isError: true
+      };
+    }
+  }
+);
+
+// Get deals with flexible filtering options
+server.tool(
+  "get-deals",
+  "Get deals from Pipedrive with flexible filtering options including search by title, date range, owner, stage, status, and more. Use 'get-users' tool first to find owner IDs.",
+  {
+    searchTitle: z.string().optional().describe("Search deals by title/name (partial matches supported)"),
+    daysBack: z.number().optional().describe("Number of days back to fetch deals based on last activity date (default: 365)"),
+    ownerId: z.number().optional().describe("Filter deals by owner/user ID (use get-users tool to find IDs)"),
+    stageId: z.number().optional().describe("Filter deals by stage ID"),
+    status: z.enum(['open', 'won', 'lost', 'deleted']).optional().describe("Filter deals by status (default: open)"),
+    pipelineId: z.number().optional().describe("Filter deals by pipeline ID"),
+    minValue: z.number().optional().describe("Minimum deal value filter"),
+    maxValue: z.number().optional().describe("Maximum deal value filter"),
+    limit: z.number().optional().describe("Maximum number of deals to return (default: 500)")
+  },
+  async ({
+    searchTitle,
+    daysBack = 365,
+    ownerId,
+    stageId,
+    status = 'open',
+    pipelineId,
+    minValue,
+    maxValue,
+    limit = 500
+  }) => {
+    try {
+      let filteredDeals: any[] = [];
+
+      // If searching by title, use the search API first
+      if (searchTitle) {
+        // @ts-ignore - Bypass incorrect TypeScript definition
+        const searchResponse = await dealsApi.searchDeals(searchTitle);
+        filteredDeals = searchResponse.data || [];
+      } else {
+        // Calculate the date filter (daysBack days ago)
+        const filterDate = new Date();
+        filterDate.setDate(filterDate.getDate() - daysBack);
+        const startDate = filterDate.toISOString().split('T')[0]; // Format as YYYY-MM-DD
+
+        // Build API parameters (using actual Pipedrive API parameter names)
+        const params: any = {
+          sort: 'last_activity_date DESC',
+          status: status,
+          limit: limit
+        };
+
+        // Add optional filters
+        if (ownerId) params.user_id = ownerId;
+        if (stageId) params.stage_id = stageId;
+        if (pipelineId) params.pipeline_id = pipelineId;
+
+        // Fetch deals with filters
+        // @ts-ignore - getDeals accepts parameters but types may be incomplete
+        const response = await dealsApi.getDeals(params);
+        filteredDeals = response.data || [];
+      }
+
+      // Apply additional client-side filtering
+
+      // Filter by date if not searching by title
+      if (!searchTitle) {
+        const filterDate = new Date();
+        filterDate.setDate(filterDate.getDate() - daysBack);
+
+        filteredDeals = filteredDeals.filter((deal: any) => {
+          if (!deal.last_activity_date) return false;
+          const dealActivityDate = new Date(deal.last_activity_date);
+          return dealActivityDate >= filterDate;
+        });
+      }
+
+      // Filter by owner if specified and not already applied in API call
+      if (ownerId && searchTitle) {
+        filteredDeals = filteredDeals.filter((deal: any) => deal.owner_id === ownerId);
+      }
+
+      // Filter by status if specified and searching by title
+      if (status && searchTitle) {
+        filteredDeals = filteredDeals.filter((deal: any) => deal.status === status);
+      }
+
+      // Filter by stage if specified and not already applied in API call
+      if (stageId && (searchTitle || !stageId)) {
+        filteredDeals = filteredDeals.filter((deal: any) => deal.stage_id === stageId);
+      }
+
+      // Filter by pipeline if specified and not already applied in API call
+      if (pipelineId && (searchTitle || !pipelineId)) {
+        filteredDeals = filteredDeals.filter((deal: any) => deal.pipeline_id === pipelineId);
+      }
+
+      // Filter by value range if specified
+      if (minValue !== undefined || maxValue !== undefined) {
+        filteredDeals = filteredDeals.filter((deal: any) => {
+          const value = parseFloat(deal.value) || 0;
+          if (minValue !== undefined && value < minValue) return false;
+          if (maxValue !== undefined && value > maxValue) return false;
+          return true;
+        });
+      }
+
+      // Apply limit
+      if (filteredDeals.length > limit) {
+        filteredDeals = filteredDeals.slice(0, limit);
+      }
+
+      // Build filter summary for response
+      const filterSummary = {
+        ...(searchTitle && { search_title: searchTitle }),
+        ...(!searchTitle && { days_back: daysBack }),
+        ...(!searchTitle && { filter_date: new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString().split('T')[0] }),
+        status: status,
+        ...(ownerId && { owner_id: ownerId }),
+        ...(stageId && { stage_id: stageId }),
+        ...(pipelineId && { pipeline_id: pipelineId }),
+        ...(minValue !== undefined && { min_value: minValue }),
+        ...(maxValue !== undefined && { max_value: maxValue }),
+        total_deals_found: filteredDeals.length,
+        limit_applied: limit
+      };
+
+      // Summarize deals to avoid massive responses but include notes and booking details
+      const bookingFieldKey = "8f4b27fbd9dfc70d2296f23ce76987051ad7324e";
+      const summarizedDeals = filteredDeals.map((deal: any) => ({
+        id: deal.id,
+        title: deal.title,
+        value: deal.value,
+        currency: deal.currency,
+        status: deal.status,
+        stage_name: deal.stage?.name || 'Unknown',
+        pipeline_name: deal.pipeline?.name || 'Unknown',
+        owner_name: deal.owner?.name || 'Unknown',
+        organization_name: deal.org?.name || null,
+        person_name: deal.person?.name || null,
+        add_time: deal.add_time,
+        last_activity_date: deal.last_activity_date,
+        close_time: deal.close_time,
+        won_time: deal.won_time,
+        lost_time: deal.lost_time,
+        notes_count: deal.notes_count || 0,
+        // Include recent notes if available
+        notes: deal.notes || [],
+        // Include custom booking details field
+        booking_details: deal[bookingFieldKey] || null
+      }));
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            summary: searchTitle
+              ? `Found ${filteredDeals.length} deals matching title search "${searchTitle}"`
+              : `Found ${filteredDeals.length} deals matching the specified filters`,
+            filters_applied: filterSummary,
+            total_found: filteredDeals.length,
+            deals: summarizedDeals.slice(0, 30) // Limit to 30 deals max to prevent huge responses
+          }, null, 2)
         }]
       };
     } catch (error) {
@@ -101,7 +336,8 @@ server.tool(
   },
   async ({ dealId }) => {
     try {
-      const response = await dealsApi.getDeal({ id: dealId });
+      // @ts-ignore - Bypass incorrect TypeScript definition, API expects just the ID
+      const response = await dealsApi.getDeal(dealId);
       return {
         content: [{
           type: "text",
@@ -121,6 +357,74 @@ server.tool(
   }
 );
 
+// Get deal notes and custom booking details
+server.tool(
+  "get-deal-notes",
+  "Get detailed notes and custom booking details for a specific deal",
+  {
+    dealId: z.number().describe("Pipedrive deal ID"),
+    limit: z.number().optional().describe("Maximum number of notes to return (default: 20)")
+  },
+  async ({ dealId, limit = 20 }) => {
+    try {
+      const result: any = {
+        deal_id: dealId,
+        notes: [],
+        booking_details: null
+      };
+
+      // Get deal details including custom fields
+      try {
+        // @ts-ignore - Bypass incorrect TypeScript definition
+        const dealResponse = await dealsApi.getDeal(dealId);
+        const deal = dealResponse.data;
+
+        // Extract custom booking field
+        const bookingFieldKey = "8f4b27fbd9dfc70d2296f23ce76987051ad7324e";
+        if (deal && deal[bookingFieldKey]) {
+          result.booking_details = deal[bookingFieldKey];
+        }
+      } catch (dealError) {
+        console.error(`Error fetching deal details for ${dealId}:`, dealError);
+        result.deal_error = getErrorMessage(dealError);
+      }
+
+      // Get deal notes
+      try {
+        // @ts-ignore - API parameters may not be fully typed
+        // @ts-ignore - Bypass incorrect TypeScript definition
+        const notesResponse = await notesApi.getNotes({
+          deal_id: dealId,
+          limit: limit
+        });
+        result.notes = notesResponse.data || [];
+      } catch (noteError) {
+        console.error(`Error fetching notes for deal ${dealId}:`, noteError);
+        result.notes_error = getErrorMessage(noteError);
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            summary: `Retrieved ${result.notes.length} notes and booking details for deal ${dealId}`,
+            ...result
+          }, null, 2)
+        }]
+      };
+    } catch (error) {
+      console.error(`Error fetching deal notes ${dealId}:`, error);
+      return {
+        content: [{
+          type: "text",
+          text: `Error fetching deal notes ${dealId}: ${getErrorMessage(error)}`
+        }],
+        isError: true
+      };
+    }
+  }
+);
+
 // Search deals
 server.tool(
   "search-deals",
@@ -130,7 +434,8 @@ server.tool(
   },
   async ({ term }) => {
     try {
-      const response = await dealsApi.searchDeals({ term });
+      // @ts-ignore - Bypass incorrect TypeScript definition
+      const response = await dealsApi.searchDeals(term);
       return {
         content: [{
           type: "text",
@@ -186,7 +491,8 @@ server.tool(
   },
   async ({ personId }) => {
     try {
-      const response = await personsApi.getPerson({ id: personId });
+      // @ts-ignore - Bypass incorrect TypeScript definition
+      const response = await personsApi.getPerson(personId);
       return {
         content: [{
           type: "text",
@@ -215,7 +521,8 @@ server.tool(
   },
   async ({ term }) => {
     try {
-      const response = await personsApi.searchPersons({ term });
+      // @ts-ignore - Bypass incorrect TypeScript definition
+      const response = await personsApi.searchPersons(term);
       return {
         content: [{
           type: "text",
@@ -271,7 +578,8 @@ server.tool(
   },
   async ({ organizationId }) => {
     try {
-      const response = await organizationsApi.getOrganization({ id: organizationId });
+      // @ts-ignore - Bypass incorrect TypeScript definition
+      const response = await organizationsApi.getOrganization(organizationId);
       return {
         content: [{
           type: "text",
@@ -300,7 +608,8 @@ server.tool(
   },
   async ({ term }) => {
     try {
-      const response = await organizationsApi.searchOrganizations({ term });
+      // @ts-ignore - API method exists but TypeScript definition is wrong
+      const response = await (organizationsApi as any).searchOrganization({ term });
       return {
         content: [{
           type: "text",
@@ -356,7 +665,8 @@ server.tool(
   },
   async ({ pipelineId }) => {
     try {
-      const response = await pipelinesApi.getPipeline({ id: pipelineId });
+      // @ts-ignore - Bypass incorrect TypeScript definition
+      const response = await pipelinesApi.getPipeline(pipelineId);
       return {
         content: [{
           type: "text",
@@ -435,7 +745,8 @@ server.tool(
   },
   async ({ term }) => {
     try {
-      const response = await leadsApi.searchLeads({ term });
+      // @ts-ignore - Bypass incorrect TypeScript definition
+      const response = await leadsApi.searchLeads(term);
       return {
         content: [{
           type: "text",
